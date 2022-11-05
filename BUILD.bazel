@@ -39,11 +39,11 @@ kernel_module(
         "mailbox-wc.ko",
     ],
     kernel_build = "//gs/google-modules/soc-modules:slider",
-    kernel_module_deps = [
-        "//gs/google-modules/soc-modules:gs101_soc",
-    ],
     visibility = [
         ":__subpackages__",
         "//gs/google-modules/soc-modules:__pkg__",
+    ],
+    deps = [
+        "//gs/google-modules/soc-modules:gs101_soc",
     ],
 )
