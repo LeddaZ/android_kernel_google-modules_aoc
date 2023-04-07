@@ -1987,33 +1987,33 @@ static void aoc_configure_sysmmu(struct aoc_prvdata *p)
 
 	/* Map in the AoC carveout */
 	if (iommu_map(domain, 0x98000000, p->dram_resource.start, p->dram_size,
-		      IOMMU_READ | IOMMU_WRITE))
+		      IOMMU_READ | IOMMU_WRITE, GFP_KERNEL))
 		dev_err(dev, "mapping carveout failed\n");
 
 	/* Map in the xhci_dma carveout */
 	if (iommu_map(domain, 0x9B000000, 0x97000000, SZ_4M,
-		      IOMMU_READ | IOMMU_WRITE))
+		      IOMMU_READ | IOMMU_WRITE, GFP_KERNEL))
 		dev_err(dev, "mapping xhci_dma carveout failed\n");
 
 	/* Use a 1MB mapping instead of individual mailboxes for now */
 	/* TODO: Turn the mailbox address ranges into dtb entries */
 	if (iommu_map(domain, 0x9E000000, 0x17600000, SZ_1M,
-		      IOMMU_READ | IOMMU_WRITE))
+		      IOMMU_READ | IOMMU_WRITE, GFP_KERNEL))
 		dev_err(dev, "mapping mailboxes failed\n");
 
 	/* Map in GSA mailbox */
 	if (iommu_map(domain, 0x9E100000, 0x17C00000, SZ_1M,
-		      IOMMU_READ | IOMMU_WRITE))
+		      IOMMU_READ | IOMMU_WRITE, GFP_KERNEL))
 		dev_err(dev, "mapping gsa mailbox failed\n");
 
 	/* Map in USB for low power audio */
 	if (iommu_map(domain, 0x9E200000, 0x11100000, SZ_1M,
-		      IOMMU_READ | IOMMU_WRITE))
+		      IOMMU_READ | IOMMU_WRITE, GFP_KERNEL))
 		dev_err(dev, "mapping usb failed\n");
 
 	/* Map in modem registers */
 	if (iommu_map(domain, 0x9E300000, 0x40000000, SZ_1M,
-		      IOMMU_READ | IOMMU_WRITE))
+		      IOMMU_READ | IOMMU_WRITE, GFP_KERNEL))
 		dev_err(dev, "mapping modem failed\n");
 #endif
 }
