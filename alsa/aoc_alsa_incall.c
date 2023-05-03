@@ -26,9 +26,9 @@ static struct snd_pcm_hardware snd_aoc_playback_hw = {
 	.formats = SNDRV_PCM_FMTBIT_S8 | SNDRV_PCM_FMTBIT_U8 | SNDRV_PCM_FMTBIT_S16_LE |
 		   SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S24_3LE | SNDRV_PCM_FMTBIT_S32_LE |
 		   SNDRV_PCM_FMTBIT_FLOAT_LE,
-	.rates = SNDRV_PCM_RATE_CONTINUOUS | SNDRV_PCM_RATE_8000_96000,
+	.rates = SNDRV_PCM_RATE_CONTINUOUS | SNDRV_PCM_RATE_8000_192000,
 	.rate_min = 8000,
-	.rate_max = 96000,
+	.rate_max = 192000,
 	.channels_min = 1,
 	.channels_max = 8,
 	.buffer_bytes_max = 16384 * 16,
@@ -476,7 +476,7 @@ static int aoc_pcm_new(struct snd_soc_component *component, struct snd_soc_pcm_r
 	if (rtd->dai_link->dpcm_playback) {
 		substream = rtd->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
 		snd_pcm_lib_preallocate_pages(substream, SNDRV_DMA_TYPE_CONTINUOUS,
-					      snd_dma_continuous_data(GFP_KERNEL),
+					      component->dev,
 					      snd_aoc_playback_hw.buffer_bytes_max,
 					      snd_aoc_playback_hw.buffer_bytes_max);
 	}
@@ -484,7 +484,7 @@ static int aoc_pcm_new(struct snd_soc_component *component, struct snd_soc_pcm_r
 	if (rtd->dai_link->dpcm_capture) {
 		substream = rtd->pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream;
 		snd_pcm_lib_preallocate_pages(substream, SNDRV_DMA_TYPE_CONTINUOUS,
-					      snd_dma_continuous_data(GFP_KERNEL),
+					      component->dev,
 					      snd_aoc_playback_hw.buffer_bytes_max,
 					      snd_aoc_playback_hw.buffer_bytes_max);
 	}

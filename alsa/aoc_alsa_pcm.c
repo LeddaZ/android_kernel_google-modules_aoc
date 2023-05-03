@@ -126,9 +126,9 @@ static struct snd_pcm_hardware snd_aoc_playback_hw = {
 	.formats = SNDRV_PCM_FMTBIT_S8 | SNDRV_PCM_FMTBIT_U8 | SNDRV_PCM_FMTBIT_S16_LE |
 		   SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S24_3LE | SNDRV_PCM_FMTBIT_S32_LE |
 		   SNDRV_PCM_FMTBIT_FLOAT_LE,
-	.rates = SNDRV_PCM_RATE_CONTINUOUS | SNDRV_PCM_RATE_8000_48000,
+	.rates = SNDRV_PCM_RATE_CONTINUOUS | SNDRV_PCM_RATE_8000_96000,
 	.rate_min = 8000,
-	.rate_max = 48000,
+	.rate_max = 96000,
 	.channels_min = 1,
 	.channels_max = 4,
 	.buffer_bytes_max = 16384 * 6,
@@ -200,7 +200,11 @@ static enum hrtimer_restart aoc_pcm_hrtimer_irq_handler(struct hrtimer *timer)
 		alsa_stream->pos = (consumed - alsa_stream->hw_ptr_base) % alsa_stream->buffer_size;
 	}
 
-	schedule_work(&alsa_stream->pcm_period_work);
+	if (!queue_work(system_highpri_wq, &alsa_stream->pcm_period_work)) {
+		pr_err("period work is busy, try to wakeup sleep thread\n");
+		wake_up(&alsa_stream->substream->runtime->sleep);
+		wake_up(&alsa_stream->substream->runtime->tsleep);
+	}
 
 	return HRTIMER_RESTART;
 }
@@ -636,46 +640,6 @@ static int snd_aoc_pcm_mmap(struct snd_soc_component *component,
 	return err;
 }
 
-static int snd_aoc_pcm_ack(struct snd_pcm_substream *substream)
-{
-	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct aoc_alsa_stream *alsa_stream = runtime->private_data;
-	struct aoc_service_dev *dev = alsa_stream->dev;
-	unsigned long old_appl_ptr, appl_ptr;
-
-	/* mmap only for ULL. TODO: extend to more entry points */
-	if (alsa_stream->entry_point_idx != ULL)
-		return 0;
-
-	appl_ptr = frames_to_bytes(runtime, runtime->control->appl_ptr);
-
-	/* Update write/read pointer depending on the stream type */
-	if (alsa_stream->substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-		old_appl_ptr =
-			aoc_ring_bytes_written(dev->service, AOC_DOWN) - alsa_stream->hw_ptr_base;
-
-		pr_debug_ratelimited("ack(): old_ptr=%lu(hw_ptr=%lu), new_ptr=%lu, written:%lu\n",
-				     old_appl_ptr, alsa_stream->hw_ptr_base, appl_ptr,
-				     appl_ptr - old_appl_ptr);
-
-		if (!aoc_service_advance_write_index(dev->service, AOC_DOWN,
-						     appl_ptr - old_appl_ptr))
-			return -EINVAL;
-
-	} else {
-		old_appl_ptr = aoc_ring_bytes_read(dev->service, AOC_UP) - alsa_stream->hw_ptr_base;
-
-		pr_debug_ratelimited("ack(): old_ptr=%lu(hw_ptr=%lu), new_ptr=%lu, written:%lu\n",
-				     old_appl_ptr, alsa_stream->hw_ptr_base, appl_ptr,
-				     appl_ptr - old_appl_ptr);
-
-		if (!aoc_service_advance_read_index(dev->service, AOC_UP, appl_ptr - old_appl_ptr))
-			return -EINVAL;
-	}
-
-	return 0;
-}
-
 static int snd_aoc_pcm_lib_ioctl(struct snd_soc_component *component,
 				 struct snd_pcm_substream *substream, unsigned int cmd, void *arg)
 {
@@ -693,7 +657,7 @@ static int aoc_pcm_new(struct snd_soc_component *component, struct snd_soc_pcm_r
 	if (rtd->dai_link->dpcm_playback) {
 		substream = rtd->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
 		snd_pcm_lib_preallocate_pages(substream, SNDRV_DMA_TYPE_CONTINUOUS,
-					      snd_dma_continuous_data(GFP_KERNEL),
+					      component->dev,
 					      snd_aoc_playback_hw.buffer_bytes_max,
 					      snd_aoc_playback_hw.buffer_bytes_max);
 	}
@@ -701,15 +665,11 @@ static int aoc_pcm_new(struct snd_soc_component *component, struct snd_soc_pcm_r
 	if (rtd->dai_link->dpcm_capture) {
 		substream = rtd->pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream;
 		snd_pcm_lib_preallocate_pages(substream, SNDRV_DMA_TYPE_CONTINUOUS,
-					      snd_dma_continuous_data(GFP_KERNEL),
+					      component->dev,
 					      snd_aoc_playback_hw.buffer_bytes_max,
 					      snd_aoc_playback_hw.buffer_bytes_max);
 	}
 
-	/* For pcm mmap, 5.9 removed ack() in snd_soc_component */
-	if (!rtd->ops.ack) {
-		rtd->ops.ack = snd_aoc_pcm_ack;
-	}
 
 	rtd->pcm->nonatomic = true;
 

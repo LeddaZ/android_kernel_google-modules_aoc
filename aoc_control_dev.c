@@ -34,6 +34,7 @@ struct stats_prvdata {
 	struct aoc_stat *discovered_stats;
 	int total_stats;
 	long service_timeout;
+	u8 memory_vote_core_id;
 };
 
 /* Driver methods */
@@ -174,7 +175,7 @@ static ssize_t memory_exception_show(struct device *dev,
 
 static DEVICE_ATTR_RO(memory_exception);
 
-static ssize_t memory_votes_show(struct device *dev,
+static ssize_t memory_votes_stats(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct stats_prvdata *prvdata = dev_get_drvdata(dev);
@@ -184,6 +185,11 @@ static ssize_t memory_votes_show(struct device *dev,
 	u32 i;
 	u32 bytes_written;
 	int ret;
+	const char* core_names[] = {"A32", "FF1", "HF0", "HF1"};
+
+	if (prvdata->memory_vote_core_id < 1 ||
+		prvdata->memory_vote_core_id > 4)
+		return -EINVAL;
 
 	AocCmdHdrSet(&get_count_cmd.parent, CMD_GET_MEMORY_VOTES_DATA_COUNT_ID,
 		sizeof(get_count_cmd));
@@ -198,11 +204,13 @@ static ssize_t memory_votes_show(struct device *dev,
 
 	bytes_written = 0;
 
+	bytes_written += scnprintf(buf + bytes_written, PAGE_SIZE - bytes_written,
+				"\nCore %s:\n", core_names[prvdata->memory_vote_core_id - 1]);
 	for (i = 0; i < total_count; i++) {
-
 		AocCmdHdrSet(&get_data_cmd.parent, CMD_GET_MEMORY_VOTES_DATA_ID, sizeof(get_data_cmd));
 		get_data_cmd.app_id = i;
 		get_data_cmd.valid = false;
+		get_data_cmd.core_id = prvdata->memory_vote_core_id;
 
 		ret = read_attribute(prvdata, &get_data_cmd, sizeof(get_data_cmd),
 			&get_data_cmd, sizeof(get_data_cmd));
@@ -212,7 +220,7 @@ static ssize_t memory_votes_show(struct device *dev,
 
 		if (get_data_cmd.valid) {
 			bytes_written += scnprintf(buf + bytes_written, PAGE_SIZE - bytes_written,
-				"App %hhu, votes Curr/Tot/ON %5u / %5u / %5u Last %10llu us, Dur %10llu us\n",
+				"App %2hhu, votes Curr/Tot/ON %5u / %5u / %5u Last %10llu us, Dur %10llu us\n",
 				get_data_cmd.app_id,
 				get_data_cmd.votes,
 				get_data_cmd.total_votes,
@@ -225,7 +233,107 @@ static ssize_t memory_votes_show(struct device *dev,
 	return bytes_written;
 }
 
-static DEVICE_ATTR_RO(memory_votes);
+#define DECLARE_MEMORY_VOTES(memory_votes_name, id)                            \
+	static ssize_t memory_votes_name##_show(                               \
+		struct device *dev, struct device_attribute *attr, char *buf)  \
+	{                                                                      \
+		struct stats_prvdata *prvdata = dev_get_drvdata(dev);          \
+		prvdata->memory_vote_core_id = id;                             \
+		return memory_votes_stats(dev, attr, buf);                     \
+	}                                                                      \
+	static DEVICE_ATTR_RO(memory_votes_name)
+
+DECLARE_MEMORY_VOTES(memory_votes_a32, 1);
+DECLARE_MEMORY_VOTES(memory_votes_ff1, 2);
+
+/* Driver methods */
+
+/*
+ * Convenience method to send a write to the AoC.
+ * Returns negative codes for errors.
+ */
+static ssize_t write_attribute(struct stats_prvdata *prvdata, void *in_cmd,
+			      size_t in_size)
+{
+	struct aoc_service_dev *service = prvdata->service;
+	ssize_t ret;
+
+	ret = mutex_lock_interruptible(&prvdata->lock);
+	if (ret != 0)
+		return ret;
+
+	if (aoc_service_flush_read_data(service))
+		pr_err("Previous response left in channel\n");
+
+	ret = aoc_service_write_timeout(service, in_cmd, in_size, prvdata->service_timeout);
+
+	mutex_unlock(&prvdata->lock);
+	return ret;
+}
+
+static ssize_t udfps_set_clock_source_store(struct device *dev,
+				     struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct stats_prvdata *prvdata = dev_get_drvdata(dev);
+	struct CMD_UDFPS_SET_CLOCK_SOURCE clock_src = { 0 };
+	uint8_t type;
+	int ret;
+
+	AocCmdHdrSet(&clock_src.parent, CMD_UDFPS_SET_CLOCK_SOURCE_ID,
+		     sizeof(clock_src));
+	ret = kstrtou8(buf, 10, &type);
+	if (ret < 0)
+		return ret;
+	if (type < SOURCE_TOT)
+		clock_src.clock_source = type;
+        else
+		dev_err(dev, "Invalid input parameter = %d\n", type);
+
+	ret = write_attribute(prvdata, &clock_src, sizeof(clock_src));
+
+	if (ret < 0) {
+		dev_err(dev, "udfps freq start ret = %d\n", ret);
+        }
+
+	return ret;
+}
+
+static DEVICE_ATTR_WO(udfps_set_clock_source);
+
+static ssize_t udfps_get_clock_frequency(uint8_t clk_src, struct device *dev, char *buf)
+{
+	struct stats_prvdata *prvdata = dev_get_drvdata(dev);
+	struct CMD_UDFPS_GET_CLOCK_FREQUENCY get_freq_cmd = { 0 };
+	int ret;
+
+	AocCmdHdrSet(&get_freq_cmd.parent, CMD_UDFPS_GET_CLOCK_FREQUENCY_ID,
+		     sizeof(get_freq_cmd));
+
+	get_freq_cmd.clock_source = clk_src;
+	ret = read_attribute(prvdata, &get_freq_cmd, sizeof(get_freq_cmd),
+			     &get_freq_cmd, sizeof(get_freq_cmd));
+
+	if (ret < 0)
+		return ret;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", get_freq_cmd.clock_freq_in_u32);
+}
+
+static ssize_t udfps_get_osc_freq_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	return udfps_get_clock_frequency(0, dev, buf);
+}
+
+static DEVICE_ATTR_RO(udfps_get_osc_freq);
+
+static ssize_t udfps_get_disp_freq_show(struct device *dev,
+					struct device_attribute *attr, char *buf)
+{
+	return udfps_get_clock_frequency(1, dev, buf);
+}
+
+static DEVICE_ATTR_RO(udfps_get_disp_freq);
 
 static ssize_t read_timed_stat(struct device *dev, char *buf, int index)
 {
@@ -411,7 +519,11 @@ static struct attribute *aoc_stats_attrs[] = {
 	&dev_attr_logging_wakeup.attr,
 	&dev_attr_hotword_wakeup.attr,
 	&dev_attr_memory_exception.attr,
-	&dev_attr_memory_votes.attr,
+	&dev_attr_memory_votes_a32.attr,
+	&dev_attr_memory_votes_ff1.attr,
+	&dev_attr_udfps_set_clock_source.attr,
+	&dev_attr_udfps_get_osc_freq.attr,
+	&dev_attr_udfps_get_disp_freq.attr,
 	NULL
 };
 
@@ -519,6 +631,7 @@ static int aoc_control_probe(struct aoc_service_dev *sd)
 	prvdata->service = sd;
 	prvdata->service_timeout = msecs_to_jiffies(100);
 	mutex_init(&prvdata->lock);
+	prvdata->memory_vote_core_id = 1;
 
 	INIT_WORK(&prvdata->discovery_work, discovery_workitem);
 	dev_set_drvdata(dev, prvdata);
