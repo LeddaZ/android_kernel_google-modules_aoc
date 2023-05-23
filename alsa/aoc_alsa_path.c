@@ -288,7 +288,7 @@ static struct snd_soc_dai_driver aoc_dai_drv[] = {
 			.rates = SNDRV_PCM_RATE_48000,
 			.formats = SNDRV_PCM_FMTBIT_S32_LE,
 			.channels_min = 2,
-			.channels_max = 2,
+			.channels_max = 4,
 		},
 		.name = "audio_raw",
 		.id = IDX_RAW_RX,
@@ -332,7 +332,7 @@ static struct snd_soc_dai_driver aoc_dai_drv[] = {
 			.rates = SNDRV_PCM_RATE_96000,
 			.formats = SNDRV_PCM_FMTBIT_S32_LE,
 			.channels_min = 2,
-			.channels_max = 2,
+			.channels_max = 4,
 		},
 		.name = "audio_ultrasonic",
 		.id = IDX_US_RX,
@@ -546,6 +546,18 @@ static struct snd_soc_dai_driver aoc_dai_drv[] = {
 		},
 		.name = "audio_android_aec",
 		.id = IDX_ANDROID_AEC_TX,
+	},
+
+	{
+		.capture = {
+			.stream_name = "audio_hotword_tap",
+			.rates = SNDRV_PCM_RATE_16000,
+			.formats = SNDRV_PCM_FMTBIT_S16_LE,
+			.channels_min = 1,
+			.channels_max = 2,
+		},
+		.name = "audio_hotword_tap",
+		.id = IDX_HOTWORD_TAP_TX,
 	},
 
 	/* BE dai */

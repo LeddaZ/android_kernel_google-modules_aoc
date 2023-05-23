@@ -80,7 +80,11 @@
 #define AOC_S2MPU_CTRL0 0x0
 
 #define AOC_MAX_MINOR (1U)
-#define AOC_MBOX_CHANNELS 16
+#if IS_ENABLED(CONFIG_SOC_GS101)
+	#define AOC_MBOX_CHANNELS 16 /* AP-A32 mbox */
+#else
+	#define AOC_MBOX_CHANNELS (16 * 3) /* AP-A32, AP-F1 and AP-P6 mbox */
+#endif
 
 #define AOC_FWDATA_ENTRIES 10
 #define AOC_FWDATA_BOARDID_DFL  0x20202
@@ -110,6 +114,10 @@
 #endif
 
 #define MAX_SENSOR_POWER_NUM 5
+
+#define RESET_WAIT_TIMES_NUM 3
+#define RESET_WAIT_TIME_MS 3000
+#define RESET_WAIT_TIME_INCREMENT_MS  2048
 
 static DEFINE_MUTEX(aoc_service_lock);
 
@@ -197,11 +205,18 @@ struct aoc_prvdata {
 	struct notifier_block itmon_nb;
 #endif
 	struct device *gsa_dev;
+	bool protected_by_gsa;
 
 	int sensor_power_count;
 	const char *sensor_power_list[MAX_SENSOR_POWER_NUM];
 	struct regulator *sensor_regulator[MAX_SENSOR_POWER_NUM];
+
+	int reset_hysteresis_trigger_ms;
+	u64 last_reset_time_ns;
+	int reset_wait_time_index;
 };
+
+struct aoc_prvdata *aoc_prvdata_copy;
 
 /* TODO: Reduce the global variables (move into a driver structure) */
 /* Resources found from the device tree */
@@ -816,6 +831,7 @@ static void aoc_fw_callback(const struct firmware *fw, void *ctx)
 	}
 
 	fw_signed = _aoc_fw_is_signed(fw);
+	prvdata->protected_by_gsa = fw_signed;
 
 	dev_info(dev, "Loading %s aoc image\n", fw_signed ? "signed" : "unsigned");
 
@@ -1030,6 +1046,22 @@ ssize_t aoc_service_read(struct aoc_service_dev *dev, uint8_t *buffer,
 	return msg_size;
 }
 EXPORT_SYMBOL_GPL(aoc_service_read);
+
+
+bool aoc_online_state(struct aoc_service_dev *dev) {
+	struct aoc_prvdata *prvdata;
+	if (!dev)
+		return false;
+
+	prvdata = dev_get_drvdata(dev->dev.parent);
+	if (!prvdata)
+		return false;
+
+	if (aoc_state != AOC_STATE_ONLINE || work_busy(&prvdata->watchdog_work))
+		return false;
+	return true;
+}
+EXPORT_SYMBOL_GPL(aoc_online_state);
 
 ssize_t aoc_service_read_timeout(struct aoc_service_dev *dev, uint8_t *buffer,
 				 size_t count, long timeout)
@@ -1557,6 +1589,7 @@ static void acpm_aoc_reset_callback(unsigned int *cmd, unsigned int size)
 		return;
 
 	prvdata = platform_get_drvdata(aoc_platform_device);
+	pr_info("AOC prvdata pointer is: %p (expected: %p)", prvdata, aoc_prvdata_copy);
 	prvdata->aoc_reset_done = true;
 	wake_up(&prvdata->aoc_reset_wait_queue);
 }
@@ -2356,13 +2389,28 @@ static void aoc_take_offline(struct aoc_prvdata *prvdata)
 			dev_err(prvdata->dev, "timed out waiting for aoc_ack\n");
 	}
 
-	/* TODO: GSA_AOC_SHUTDOWN needs to be 4, but the current header defines
-	 * as 2.  Change this when the header is updated
-	 */
-	gsa_send_aoc_cmd(prvdata->gsa_dev, 4);
-	rc = gsa_unload_aoc_fw_image(prvdata->gsa_dev);
-	if (rc)
-		dev_err(prvdata->dev, "GSA unload firmware failed: %d\n", rc);
+	if(prvdata->protected_by_gsa) {
+		/* TODO(b/275463650): GSA_AOC_SHUTDOWN needs to be 4, but the current
+		 * header defines as 2.  Change this to enum when the header is updated.
+		 */
+		rc = gsa_send_aoc_cmd(prvdata->gsa_dev, 4);
+		/* rc is the new state of AOC unless it's negative,
+		 * in which case it's an error code
+		 */
+		if(rc != GSA_AOC_STATE_LOADED) {
+			if(rc >= 0) {
+				dev_err(prvdata->dev,
+					"GSA shutdown command returned unexpected state: %d\n", rc);
+			} else {
+				dev_err(prvdata->dev,
+					"GSA shutdown command returned error: %d\n", rc);
+			}
+		}
+
+		rc = gsa_unload_aoc_fw_image(prvdata->gsa_dev);
+		if (rc)
+			dev_err(prvdata->dev, "GSA unload firmware failed: %d\n", rc);
+	}
 }
 
 static void aoc_process_services(struct aoc_prvdata *prvdata, int offset)
@@ -2527,12 +2575,34 @@ static void aoc_watchdog(struct work_struct *work)
 	const int sscd_retry_ms = 1000;
 	int sscd_rc;
 	char crash_info[RAMDUMP_SECTION_CRASH_INFO_SIZE];
-	char ap_reset_reason[RAMDUMP_SECTION_CRASH_INFO_SIZE];
 	int restart_rc;
 	u32 section_flags;
 	bool ap_reset = false;
 
 	prvdata->total_restarts++;
+
+	/* Initialize crash_info[0] to identify if it has changed later in the function. */
+	crash_info[0] = 0;
+
+	if (prvdata->ap_triggered_reset) {
+		if ((ktime_get_real_ns() - prvdata->last_reset_time_ns) / 1000000
+			<= prvdata->reset_hysteresis_trigger_ms) {
+			/* If the watchdog was triggered recently, busy wait to
+			 * avoid overlapping resets.
+			 */
+			dev_err(prvdata->dev, "Triggered hysteresis for AP reset, waiting %d ms",
+				RESET_WAIT_TIME_MS +
+				prvdata->reset_wait_time_index * RESET_WAIT_TIME_INCREMENT_MS);
+			msleep(RESET_WAIT_TIME_MS +
+				prvdata->reset_wait_time_index * RESET_WAIT_TIME_INCREMENT_MS);
+			if (prvdata->reset_wait_time_index < RESET_WAIT_TIMES_NUM)
+				prvdata->reset_wait_time_index++;
+		} else {
+			prvdata->reset_wait_time_index = 0;
+		}
+	}
+
+	prvdata->last_reset_time_ns = ktime_get_real_ns();
 
 	sscd_info.name = "aoc";
 	sscd_info.seg_count = 0;
@@ -2547,12 +2617,10 @@ static void aoc_watchdog(struct work_struct *work)
 	}
 
 	if (prvdata->ap_triggered_reset) {
+		dev_info(prvdata->dev, "AP triggered reset, reason: [%s]",
+			prvdata->ap_reset_reason);
 		prvdata->ap_triggered_reset = false;
 		ap_reset = true;
-
-		snprintf(ap_reset_reason, RAMDUMP_SECTION_CRASH_INFO_SIZE - 1,
-			"AP Reset: %s", prvdata->ap_reset_reason);
-
 		trigger_aoc_ramdump(prvdata);
 	}
 
@@ -2567,10 +2635,10 @@ static void aoc_watchdog(struct work_struct *work)
 		const char *crash_reason = (const char *)ramdump_header +
 			RAMDUMP_SECTION_CRASH_INFO_OFFSET;
 		bool crash_reason_valid = (strnlen(crash_reason,
-			RAMDUMP_SECTION_CRASH_INFO_SIZE) != 0);
+			sizeof(crash_info)) != 0);
 
 		dev_err(prvdata->dev, "aoc coredump timed out, coredump only contains DRAM\n");
-		snprintf(crash_info, RAMDUMP_SECTION_CRASH_INFO_SIZE,
+		snprintf(crash_info, sizeof(crash_info),
 			"AoC watchdog : %s (incomplete %u:%u)",
 			crash_reason_valid ? crash_reason : "unknown reason",
 			ramdump_header->breadcrumbs[0], ramdump_header->breadcrumbs[1]);
@@ -2580,7 +2648,7 @@ static void aoc_watchdog(struct work_struct *work)
 		dev_err(prvdata->dev,
 			"aoc coredump failed: invalid magic (corruption or incompatible firmware?)\n");
 		strscpy(crash_info, "AoC Watchdog : coredump corrupt",
-			RAMDUMP_SECTION_CRASH_INFO_SIZE);
+			sizeof(crash_info));
 	}
 
 	num_pages = DIV_ROUND_UP(prvdata->dram_size, PAGE_SIZE);
@@ -2605,17 +2673,26 @@ static void aoc_watchdog(struct work_struct *work)
 			RAMDUMP_SECTION_CRASH_INFO_OFFSET;
 
 		section_flags = ramdump_header->sections[RAMDUMP_SECTION_CRASH_INFO_INDEX].flags;
-		if (section_flags & RAMDUMP_FLAG_VALID)
-			strscpy(crash_info, crash_reason, RAMDUMP_SECTION_CRASH_INFO_SIZE);
-		else
+		if (section_flags & RAMDUMP_FLAG_VALID) {
+			dev_info(prvdata->dev, "aoc coredump has valid coredump header, crash reason [%s]",
+				crash_reason);
+			strscpy(crash_info, crash_reason, sizeof(crash_info));
+		} else {
+			dev_info(prvdata->dev, "aoc coredump has valid coredump header, but invalid crash reason");
 			strscpy(crash_info, "AoC Watchdog : invalid crash info",
-				RAMDUMP_SECTION_CRASH_INFO_SIZE);
+				sizeof(crash_info));
+		}
 	}
 
 	if (ap_reset) {
 		/* Prefer the user specified reason */
-		snprintf(crash_info, RAMDUMP_SECTION_CRASH_INFO_SIZE - 1, "%s", ap_reset_reason);
+		scnprintf(crash_info, sizeof(crash_info), "AP Reset: %s", prvdata->ap_reset_reason);
 	}
+
+	if (crash_info[0] == 0)
+		strscpy(crash_info, "AoC Watchdog: empty crash info string", sizeof(crash_info));
+
+	dev_info(prvdata->dev, "aoc crash info: [%s]", crash_info);
 
 	/* TODO(siqilin): Get paddr and vaddr base from firmware instead */
 	carveout_paddr_from_aoc = 0x98000000;
@@ -3097,12 +3174,16 @@ static int aoc_platform_probe(struct platform_device *pdev)
 		rc = -ENOMEM;
 		goto err_failed_prvdata_alloc;
 	}
+	aoc_prvdata_copy = prvdata;
 
 	prvdata->dev = dev;
 	prvdata->disable_monitor_mode = 0;
 	prvdata->enable_uart_tx = 0;
 	prvdata->force_voltage_nominal = 0;
 	prvdata->no_ap_resets = 0;
+	prvdata->reset_hysteresis_trigger_ms = 10000;
+	prvdata->last_reset_time_ns = ktime_get_real_ns();
+	prvdata->reset_wait_time_index = 0;
 
 	rc = find_gsa_device(prvdata);
 	if (rc) {
@@ -3419,6 +3500,7 @@ static void aoc_platform_shutdown(struct platform_device *pdev)
 {
 	struct aoc_prvdata *prvdata = platform_get_drvdata(pdev);
 
+	disable_irq_nosync(prvdata->watchdog_irq);
 	aoc_take_offline(prvdata);
 }
 
